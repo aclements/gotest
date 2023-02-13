@@ -6,11 +6,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -18,7 +19,8 @@ func jsonRun(args ...string) (*jsonRunner, error) {
 	goArgs := append([]string{"test", "-json"}, args...)
 	cmd := exec.Command("go", goArgs...)
 	cmd.WaitDelay = 5 * time.Second
-	cmd.Stderr = os.Stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	p, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create stdout pipe to %s: %w", cmd, err)
@@ -32,12 +34,14 @@ func jsonRun(args ...string) (*jsonRunner, error) {
 	scanner := bufio.NewScanner(p)
 	// Set a large line length limit.
 	scanner.Buffer(nil, 16<<20)
-	return &jsonRunner{cmd, scanner}, nil
+	return &jsonRunner{cmd, scanner, &stderr}, nil
 }
 
 type jsonRunner struct {
 	cmd *exec.Cmd
 	sc  *bufio.Scanner
+
+	stderr *bytes.Buffer
 }
 
 type testEvent struct {
@@ -73,5 +77,12 @@ func (r *jsonRunner) wait() error {
 		return nil
 	}
 	// Wait will close the stdout pipe
-	return r.cmd.Wait()
+	if err := r.cmd.Wait(); err != nil {
+		stderr := r.stderr.String()
+		if len(stderr) > 0 {
+			stderr = "\n" + strings.TrimRight(stderr, "\n")
+		}
+		return fmt.Errorf("%s: %w%s", r.cmd, err, stderr)
+	}
+	return nil
 }

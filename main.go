@@ -43,6 +43,7 @@ func (e ErrExit) Error() string {
 }
 
 func main1(term *Term, args []string) error {
+	// TODO: Test a package with a build error.
 	fmt.Fprintf(term, "gathering tests...")
 	term.Flush()
 	tests, err := listTests(args)
@@ -106,7 +107,7 @@ func listTests(args []string) (tests pkgs, err error) {
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			return nil, fmt.Errorf("listing tests: %w", err)
+			return nil, fmt.Errorf("error listing tests: %w", err)
 		}
 		p := tests[ev.Package]
 		if p == nil {
@@ -121,7 +122,7 @@ func listTests(args []string) (tests pkgs, err error) {
 		}
 	}
 	if err := out.wait(); err != nil {
-		return nil, fmt.Errorf("listing tests: %w", err)
+		return nil, fmt.Errorf("error listing tests: %w", err)
 	}
 	return tests, nil
 }
@@ -184,15 +185,10 @@ func runTests(term *Term, args []string, tests pkgs) error {
 	}
 
 	err = out.wait()
-	switch err := err.(type) {
-	case nil:
-		return nil
-	case *exec.ExitError:
-		if err.Exited() {
-			return ErrExit(err.ExitCode())
-		}
+	if err, ok := err.(*exec.ExitError); ok && err.Exited() {
+		return ErrExit(err.ExitCode())
 	}
-	return fmt.Errorf("go test: %w", err)
+	return err
 }
 
 func (s *state) queueOutput(cb func(t *Term)) {
