@@ -7,11 +7,14 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 )
 
 type Term struct {
 	bytes.Buffer
+
+	w io.Writer
 }
 
 type TermAttr int
@@ -23,7 +26,7 @@ var (
 )
 
 func NewTerm() *Term {
-	return &Term{}
+	return &Term{w: os.Stdout}
 }
 
 func (t *Term) CursorUp(n int) {
@@ -68,6 +71,6 @@ func (t *Term) Attr(attrs ...TermAttr) {
 }
 
 func (t *Term) Flush() {
-	os.Stdout.Write(t.Bytes())
-	t.Reset()
+	t.w.Write(t.Bytes())
+	t.Buffer.Reset()
 }

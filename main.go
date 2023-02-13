@@ -10,40 +10,62 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
 )
 
-var term *Term
-
 func main() {
-	// TODO: Pass through SIGQUIT
+	setupSignals()
+	term := NewTerm()
+	err := main1(term, os.Args[1:])
+	switch err := err.(type) {
+	case nil:
+		return
+	case ErrExit:
+		os.Exit(int(err))
+	default:
+		// Make sure the terminal is clear
+		term.BeginningOfLine()
+		term.ClearRight()
+		term.Flush()
 
-	term = NewTerm()
-
-	args := os.Args[1:]
-
-	fmt.Fprintf(term, "gathering tests...")
-	term.Flush()
-	tests := listTests(args)
-	term.BeginningOfLine()
-	term.ClearRight()
-	term.Flush()
-
-	runTests(term, args, tests)
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		os.Exit(1)
+	}
 }
 
-// fatal prints a fatal error and exits. The caller must first stop any
-// concurrent writes to the terminal.
-func fatal(f string, args ...any) {
+type ErrExit int
+
+func (e ErrExit) Error() string {
+	return fmt.Sprintf("exit code %d", int(e))
+}
+
+func main1(term *Term, args []string) error {
+	fmt.Fprintf(term, "gathering tests...")
+	term.Flush()
+	tests, err := listTests(args)
+	if err != nil {
+		return err
+	}
 	term.BeginningOfLine()
 	term.ClearRight()
 	term.Flush()
 
-	msg := fmt.Sprintf(f, args...)
-	fmt.Fprintf(os.Stderr, "%s\n", msg)
-	os.Exit(1)
+	return runTests(term, args, tests)
+}
+
+func setupSignals() {
+	// Pass through signals to sub-processes.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, signalsToIgnore...)
+	go func() {
+		<-sig
+		// This should kill the subprocess and then this process will exit, but
+		// as a backstop, stop ignoring the signals.
+		signal.Reset(signalsToIgnore...)
+	}()
 }
 
 type pkgs map[string]*pkg
@@ -71,23 +93,20 @@ type test struct {
 	output bytes.Buffer
 }
 
-func listTests(args []string) pkgs {
+func listTests(args []string) (tests pkgs, err error) {
 	out, err := jsonRun(append([]string{"-test.list=^Test|^Fuzz|^Example"}, args...)...)
-	defer func() {
-		if err := out.wait(); err != nil {
-			fatal("listing tests: %s", err)
-		}
-	}()
 	if err != nil {
-		fatal("%s", err)
+		return nil, err
 	}
-	tests := make(pkgs)
+	defer out.cmd.Process.Kill()
+
+	tests = make(pkgs)
 	for {
 		ev, err := out.next()
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			fatal("listing tests: %s", err)
+			return nil, fmt.Errorf("listing tests: %w", err)
 		}
 		// The output actions include the final "ok"/"?" line, so we need to
 		// filter that out.
@@ -101,7 +120,10 @@ func listTests(args []string) pkgs {
 			p.tests[testName] = &test{name: testName}
 		}
 	}
-	return tests
+	if err := out.wait(); err != nil {
+		return nil, fmt.Errorf("listing tests: %w", err)
+	}
+	return tests, nil
 }
 
 type state struct {
@@ -119,7 +141,7 @@ type state struct {
 	prevLines int // Lines printed on the last render
 }
 
-func runTests(term *Term, args []string, tests pkgs) {
+func runTests(term *Term, args []string, tests pkgs) error {
 	maxPkgName := 0
 	for _, pkg := range tests {
 		// Ignore packages with no tests.
@@ -131,7 +153,7 @@ func runTests(term *Term, args []string, tests pkgs) {
 
 	out, err := jsonRun(args...)
 	if err != nil {
-		fatal("%s", err)
+		return err
 	}
 	defer out.cmd.Process.Kill()
 
@@ -145,7 +167,7 @@ func runTests(term *Term, args []string, tests pkgs) {
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			fatal("reading from go test: %s", err)
+			return fmt.Errorf("reading from go test: %w", err)
 		}
 
 		// TODO: Handle action=="error"
@@ -164,15 +186,13 @@ func runTests(term *Term, args []string, tests pkgs) {
 	err = out.wait()
 	switch err := err.(type) {
 	case nil:
-		return
+		return nil
 	case *exec.ExitError:
 		if err.Exited() {
-			os.Exit(err.ExitCode())
+			return ErrExit(err.ExitCode())
 		}
-		fatal("go test: %s", err)
-	default:
-		fatal("go test: %s", err)
 	}
+	return fmt.Errorf("go test: %w", err)
 }
 
 func (s *state) apply(ev testEvent) {
