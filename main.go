@@ -75,7 +75,7 @@ type pkg struct {
 	tests map[string]*test // Sub-tests are added while running.
 
 	// Running state
-	mainTests int
+	mainTests int // Number of main tests
 	done      int // Only main tests, but includes failed
 	failed    int // Includes sub-tests
 	skipped   int // Includes sub-tests
@@ -108,15 +108,15 @@ func listTests(args []string) (tests pkgs, err error) {
 		} else if err != nil {
 			return nil, fmt.Errorf("listing tests: %w", err)
 		}
+		p := tests[ev.Package]
+		if p == nil {
+			p = &pkg{name: ev.Package, tests: make(map[string]*test)}
+			tests[ev.Package] = p
+		}
 		// The output actions include the final "ok"/"?" line, so we need to
 		// filter that out.
 		if ev.Action == "output" && ev.Package != "" && !strings.Contains(ev.Output, "\t") {
 			testName := strings.TrimRight(ev.Output, "\n")
-			p := tests[ev.Package]
-			if p == nil {
-				p = &pkg{name: ev.Package, tests: make(map[string]*test)}
-				tests[ev.Package] = p
-			}
 			p.tests[testName] = &test{name: testName}
 		}
 	}
@@ -135,8 +135,8 @@ type state struct {
 	runningPkgs  Seq[*pkg]
 	runningTests map[*pkg]*Seq[*test]
 
-	// Output to flush on the next render
-	output bytes.Buffer
+	// Callbacks to flush output on the next render
+	output []func(t *Term)
 
 	prevLines int // Lines printed on the last render
 }
@@ -195,6 +195,10 @@ func runTests(term *Term, args []string, tests pkgs) error {
 	return fmt.Errorf("go test: %w", err)
 }
 
+func (s *state) queueOutput(cb func(t *Term)) {
+	s.output = append(s.output, cb)
+}
+
 func (s *state) apply(ev testEvent) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -202,7 +206,9 @@ func (s *state) apply(ev testEvent) {
 	// Package-level logic
 	pkg := s.tests[ev.Package]
 	if pkg == nil {
-		// TODO: Print skipped packages.
+		// This shouldn't happen because we started with a package list.
+		//
+		// TODO: Maybe be more robust to this.
 		return
 	}
 	if !s.runningPkgs.Has(pkg) {
@@ -216,11 +222,13 @@ func (s *state) apply(ev testEvent) {
 		case "start":
 			// We already started the package, so nothing more to do.
 		case "output":
+			// TODO: Do something with package output other than the last
+			// "ok"/etc line.
 			pkg.lastOutput = ev.Output
 		case "pass", "fail", "skip":
 			// Package is done.
 			s.runningPkgs.Delete(pkg)
-			// Print the final "ok pkg" line.
+			// Print the package status.
 			//
 			// TODO: Should we try to keep things in order? It's probably better
 			// to report ASAP. If I really wanted to, I could keep the running
@@ -229,10 +237,30 @@ func (s *state) apply(ev testEvent) {
 			// If I did something like that, I should probably just use almost
 			// the whole terminal height. Alternatively, maybe I don't report
 			// the package status lines at all and just show a summary line?
-			//
-			// TODO: Color by status. Maybe this should be a callback that takes
-			// a Term?
-			s.output.WriteString(pkg.lastOutput)
+			s.queueOutput(func(term *Term) {
+				label := ""
+				switch ev.Action {
+				case "pass":
+					term.Attr(AttrBold, AttrGreen)
+					label = "PASS"
+				case "fail":
+					term.Attr(AttrBold, AttrRed)
+					label = "FAIL"
+				case "skip":
+					term.Attr(AttrBold, AttrYellow)
+					label = "SKIP"
+				}
+				fmt.Fprintf(term, "=== %s %s", label, ev.Package)
+				term.Attr()
+				fmt.Fprintf(term, " %d tests", len(pkg.tests))
+				if pkg.failed > 0 {
+					fmt.Fprintf(term, ", %d failed", pkg.failed)
+				}
+				if pkg.skipped > 0 {
+					fmt.Fprintf(term, ", %d skipped", pkg.skipped)
+				}
+				term.WriteByte('\n')
+			})
 		}
 		return
 	}
@@ -249,7 +277,8 @@ func (s *state) apply(ev testEvent) {
 			pkg.mainTests++
 		}
 	}
-	// TODO: What happens if a test times out?
+	// TODO: What happens if a test times out? What if it times out at the
+	// cmd/go level?
 	switch ev.Action {
 	case "run", "cont":
 		s.runningTests[pkg].Append(t)
@@ -259,29 +288,44 @@ func (s *state) apply(ev testEvent) {
 		t.start = time.Time{}
 		s.runningTests[pkg].Delete(t)
 	case "output":
-		// Strip out pause/cont lines
-		if strings.HasPrefix(ev.Output, "=== PAUSE ") ||
-			strings.HasPrefix(ev.Output, "=== CONT  ") {
+		// Strip control messages. These get parsed by test2json.
+		if strings.HasPrefix(ev.Output, "=== ") ||
+			strings.HasPrefix(ev.Output, "--- ") {
 			break
 		}
-		// TODO: Drop "=== RUN   ", move "--- FAIL"/SKIP line from the end to
-		// the beginning (or just do something different to mark tests). In the
-		// verbose output, the "--- " lines are always at the top level, but in
-		// the text format they're nested for sub-tests. It also doesn't further
-		// indent the output of subtests, while the text format does. Does a
-		// failed sub-test report a failed parent test in verbose mode?
+		// TODO: Test a failed subtest. In text format, these get indented until
+		// the parent test and the parent test prints a fail line, but I'm not
+		// sure what happens in verbose format.
+		//
+		// Buffer the test output so we can print it if it fails.
 		t.output.WriteString(ev.Output)
-	case "fail", "skip": // XXX Not skip
+	case "fail":
 		// TODO: Do I care about test order? Package order? If it's not in
 		// package order, how do I show which package a failed test is in? Maybe
 		// I just print custom fail lines anyway so I can put whatever I want.
 		//
-		// TODO: Maybe this should print a summary and record the whole log
-		// somewhere with a command to print the details of a failed test (or
-		// any test)?
-		s.output.Write(t.output.Bytes())
+		// TODO: Print a summary and record the whole log somewhere with a
+		// command to print the details of a failed test (or any test).
+		output := t.output.Bytes()
+		s.queueOutput(func(term *Term) {
+			label := ""
+			switch ev.Action {
+			case "pass":
+				label = "PASS"
+				term.Attr(AttrGreen)
+			case "skip":
+				label = "SKIP"
+				term.Attr(AttrYellow)
+			case "fail":
+				label = "FAIL"
+				term.Attr(AttrRed)
+			}
+			fmt.Fprintf(term, "--- %s %s %s\n", label, ev.Test, ev.Package)
+			term.Attr()
+			term.Write(output)
+		})
 		fallthrough
-	case "pass":
+	case "pass", "skip":
 		s.runningTests[pkg].Delete(t)
 		if isMain {
 			pkg.done++
@@ -306,8 +350,10 @@ func (s *state) render(t *Term, h int) {
 	s.prevLines = 0
 
 	// Flush output.
-	t.Write(s.output.Bytes())
-	s.output.Reset()
+	for _, cb := range s.output {
+		cb(t)
+	}
+	s.output = s.output[:0]
 
 	// Prep for these lines
 	t.SetWrap(false)

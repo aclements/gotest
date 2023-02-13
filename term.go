@@ -20,6 +20,7 @@ type Term struct {
 type TermAttr int
 
 var (
+	AttrBold   TermAttr = 1
 	AttrRed    TermAttr = 31
 	AttrGreen  TermAttr = 32
 	AttrYellow TermAttr = 33
