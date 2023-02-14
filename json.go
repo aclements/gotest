@@ -79,9 +79,12 @@ func (r *jsonRunner) wait() error {
 	// Wait will close the stdout pipe
 	if err := r.cmd.Wait(); err != nil {
 		stderr := r.stderr.String()
-		if len(stderr) > 0 {
-			stderr = "\n" + strings.TrimRight(stderr, "\n")
+		if len(stderr) == 0 {
+			// Return the usual ExitError.
+			return err
 		}
+		// Something went more wrong than expected. Wrap the ExitError with more detail.
+		stderr = "\n" + strings.TrimRight(stderr, "\n")
 		return fmt.Errorf("%s: %w%s", r.cmd, err, stderr)
 	}
 	return nil
