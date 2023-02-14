@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -169,6 +170,27 @@ func runTests(term *Term, args []string, tests pkgs) error {
 		maxPkgName:   maxPkgName,
 		runningTests: make(map[*pkg]*Seq[*test]),
 	}
+	update := make(chan struct{}, 1)
+	go func() {
+		// Render thread.
+		timer := time.NewTimer(0)
+		for {
+			select {
+			case <-timer.C:
+			case _, ok := <-update:
+				if !ok {
+					break
+				}
+				if !timer.Stop() {
+					<-timer.C
+				}
+			}
+			next := s.render(term, 5)
+			term.Flush()
+			timer.Reset(time.Until(next))
+		}
+	}()
+	defer close(update)
 	for {
 		ev, err := out.next()
 		if err == io.EOF {
@@ -179,15 +201,13 @@ func runTests(term *Term, args []string, tests pkgs) error {
 
 		// TODO: Handle action=="error"
 
-		s.apply(ev)
-
-		// TODO: If I only show percentage, not count, maybe it makes sense to
-		// add subtests as I go, though that would make percent non-monotonic.
-
-		s.render(term, 5)
-		term.Flush()
-
-		// TODO: Render every 0.1s in case there are no updates.
+		doUpdate := s.apply(ev)
+		if doUpdate || len(s.output) > 0 {
+			select {
+			case update <- struct{}{}:
+			default:
+			}
+		}
 	}
 
 	err = out.wait()
@@ -201,7 +221,9 @@ func (s *state) queueOutput(cb func(t *Term)) {
 	s.output = append(s.output, cb)
 }
 
-func (s *state) apply(ev testEvent) {
+// apply updates the state with the given testEvent and returns whether the
+// state needs to be re-rendered.
+func (s *state) apply(ev testEvent) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -211,7 +233,7 @@ func (s *state) apply(ev testEvent) {
 		// This shouldn't happen because we started with a package list.
 		//
 		// TODO: Maybe be more robust to this.
-		return
+		return false
 	}
 	if !s.runningPkgs.Has(pkg) {
 		s.runningPkgs.Append(pkg)
@@ -223,9 +245,11 @@ func (s *state) apply(ev testEvent) {
 		switch ev.Action {
 		case "start":
 			// We already started the package, so nothing more to do.
+			return false
 		case "output":
 			// TODO: Test a package that crashes before running any tests.
 			pkg.output.WriteString(ev.Output)
+			return false
 		case "pass", "fail", "skip":
 			// Package is done. If the package failed and there are still tests
 			// running, flag those tests as failed. This can happen if a test
@@ -295,14 +319,15 @@ func (s *state) apply(ev testEvent) {
 					term.WriteString("    " + strings.ReplaceAll(output, "\n", "\n    ") + "\n")
 				}
 			})
+			return true
 		}
-		return
+		return false
 	}
 
-	s.applyTest(pkg, ev)
+	return s.applyTest(pkg, ev)
 }
 
-func (s *state) applyTest(pkg *pkg, ev testEvent) {
+func (s *state) applyTest(pkg *pkg, ev testEvent) bool {
 	// Test-level logic
 	mainTestName, _, _ := strings.Cut(ev.Test, "/")
 	isMain := ev.Test == mainTestName
@@ -318,18 +343,23 @@ func (s *state) applyTest(pkg *pkg, ev testEvent) {
 	// TODO: What happens if a test times out? What if it times out at the
 	// cmd/go level?
 	switch ev.Action {
+	default:
+		// Unknown action
+		return false
 	case "run", "cont":
 		s.runningTests[pkg].Append(t)
 		t.start = ev.Time
+		return true
 	case "pause":
 		t.extra = ev.Time.Sub(t.start)
 		t.start = time.Time{}
 		s.runningTests[pkg].Delete(t)
+		return true
 	case "output":
 		// Strip control messages. These get parsed by test2json.
 		if strings.HasPrefix(ev.Output, "=== ") ||
 			strings.HasPrefix(ev.Output, "--- ") {
-			break
+			return false
 		}
 		// TODO: Test a failed subtest. In text format, these get indented until
 		// the parent test and the parent test prints a fail line, but I'm not
@@ -337,6 +367,7 @@ func (s *state) applyTest(pkg *pkg, ev testEvent) {
 		//
 		// Buffer the test output so we can print it if it fails.
 		t.output.WriteString(ev.Output)
+		return false
 	case "fail":
 		// TODO: Do I care about test order? Package order? If it's not in
 		// package order, how do I show which package a failed test is in? Maybe
@@ -376,10 +407,16 @@ func (s *state) applyTest(pkg *pkg, ev testEvent) {
 		}
 		// Release test output memory.
 		t.output = bytes.Buffer{}
+		return true
 	}
 }
 
-func (s *state) render(t *Term, h int) {
+// render draws s to the terminal and returns the time at which render should be
+// called again if there are no state changes.
+func (s *state) render(t *Term, h int) time.Time {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	// TODO: Query actual terminal height and don't exceed it.
 
 	// Clear previous lines
@@ -413,6 +450,7 @@ func (s *state) render(t *Term, h int) {
 		maxPkgName = pkgNameLimit
 	}
 
+	next := time.Duration(math.MaxInt64)
 	for i, pkg := range s.runningPkgs.o {
 		if i > 0 {
 			t.WriteString("\n")
@@ -424,6 +462,9 @@ func (s *state) render(t *Term, h int) {
 			t.Attr(AttrRed)
 		}
 		t.WriteString(lTrim(pkg.name, maxPkgName))
+		// TODO: Since I only show percentage, not count, maybe it makes sense
+		// to add sub-tests as I go, though that would make percent
+		// non-monotonic.
 		fmt.Fprintf(t, " %3d%%", int(0.5+100*float64(pkg.done)/float64(pkg.mainTests)))
 		t.Attr()
 		if pkg.failed > 0 {
@@ -434,8 +475,12 @@ func (s *state) render(t *Term, h int) {
 			fmt.Fprintf(t, " %s", test.name)
 			// TODO: This mixes "test time" and "system time".
 			dur := test.extra + time.Since(test.start)
+			durStr, next1 := fmtDuration(dur)
 			if dur >= time.Second {
-				fmt.Fprintf(t, " (%s)", fmtDuration(dur))
+				fmt.Fprintf(t, " (%s)", durStr)
+			}
+			if next1 < next {
+				next = next1
 			}
 		}
 	}
@@ -444,6 +489,8 @@ func (s *state) render(t *Term, h int) {
 		fmt.Fprintf(t, "\n... +%d packages ...", trimmedPkgs)
 		s.prevLines++
 	}
+
+	return time.Now().Add(next)
 }
 
 // lTrim pads s to length or trims the prefix of s to length.
@@ -454,7 +501,9 @@ func lTrim(s string, length int) string {
 	return "…" + s[len(s)-length+1:]
 }
 
-func fmtDuration(d time.Duration) string {
+// fmtDuration formats d as a string and returns the duration after d when the
+// result will change.
+func fmtDuration(d time.Duration) (string, time.Duration) {
 	var b strings.Builder
 	if d >= time.Hour {
 		fmt.Fprintf(&b, "%dh", d/time.Hour)
@@ -465,5 +514,7 @@ func fmtDuration(d time.Duration) string {
 		d %= time.Minute
 	}
 	fmt.Fprintf(&b, "%ds", d/time.Second)
-	return b.String()
+	// The output will change when the next second rolls over.
+	next := (d + time.Second).Truncate(time.Second) - d
+	return b.String(), next
 }
