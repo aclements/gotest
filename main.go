@@ -44,6 +44,10 @@ func (e ErrExit) Error() string {
 
 func main1(term *Term, args []string) error {
 	// TODO: Test a package with a build error.
+	//
+	// TODO: We often spend a long time "gathering tests" because we're actually
+	// recompiling. Maybe I should just start running tests and gather the
+	// function names when I see a package start?
 	fmt.Fprintf(term, "gathering tests...")
 	term.Flush()
 	tests, err := listTests(args)
@@ -81,7 +85,7 @@ type pkg struct {
 	failed    int // Includes sub-tests
 	skipped   int // Includes sub-tests
 
-	lastOutput string
+	output bytes.Buffer
 }
 
 type test struct {
@@ -218,12 +222,34 @@ func (s *state) apply(ev testEvent) {
 		case "start":
 			// We already started the package, so nothing more to do.
 		case "output":
-			// TODO: Do something with package output other than the last
-			// "ok"/etc line.
-			pkg.lastOutput = ev.Output
+			// TODO: Test a package that crashes before running any tests.
+			//
+			// TODO: Test a package that fatally crashes during a test. This
+			// output gets attributed to the test, but then there's no "FAIL"
+			// line, so currently we silently eat the output.
+			pkg.output.WriteString(ev.Output)
 		case "pass", "fail", "skip":
 			// Package is done.
 			s.runningPkgs.Delete(pkg)
+			// Process non-test package output. This includes the final status
+			// line, which is redundant, so we trim that.
+			output := pkg.output.String()
+			pkg.output = bytes.Buffer{}
+			if strings.HasSuffix(output, "\n") {
+				lastLine := 1 + strings.LastIndex(output[:len(output)-1], "\n")
+				l := output[lastLine:]
+				if strings.HasPrefix(l, "ok  ") || strings.HasPrefix(l, "FAIL") || strings.HasPrefix(l, "?   ") {
+					output = output[:lastLine]
+				}
+			}
+			// Also trim the PASS/FAIL line.
+			if strings.HasSuffix(output, "PASS\n") || strings.HasSuffix(output, "FAIL\n") {
+				output = output[:len(output)-len("PASS\n")]
+			}
+			if strings.HasSuffix(output, "\n") {
+				// We'll add this back when printing.
+				output = output[:len(output)-1]
+			}
 			// Print the package status.
 			//
 			// TODO: Should we try to keep things in order? It's probably better
@@ -256,6 +282,9 @@ func (s *state) apply(ev testEvent) {
 					fmt.Fprintf(term, ", %d skipped", pkg.skipped)
 				}
 				term.WriteByte('\n')
+				if len(output) > 0 {
+					term.WriteString("    " + strings.ReplaceAll(output, "\n", "\n    ") + "\n")
+				}
 			})
 		}
 		return
