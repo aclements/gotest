@@ -223,13 +223,20 @@ func (s *state) apply(ev testEvent) {
 			// We already started the package, so nothing more to do.
 		case "output":
 			// TODO: Test a package that crashes before running any tests.
-			//
-			// TODO: Test a package that fatally crashes during a test. This
-			// output gets attributed to the test, but then there's no "FAIL"
-			// line, so currently we silently eat the output.
 			pkg.output.WriteString(ev.Output)
 		case "pass", "fail", "skip":
-			// Package is done.
+			// Package is done. If the package failed and there are still tests
+			// running, flag those tests as failed. This can happen if a test
+			// fatally panics, in which case that fatal panic output is
+			// attributed to the test, but there's no "FAIL" line.
+			//
+			// TODO: Test a package that fatally crashes during a test. Make
+			// sure the output appears even though there's no FAIL line.
+			if ev.Action == "fail" {
+				for _, t := range s.runningTests[pkg].o {
+					s.applyTest(pkg, testEvent{Action: "fail", Test: t.name})
+				}
+			}
 			s.runningPkgs.Delete(pkg)
 			// Process non-test package output. This includes the final status
 			// line, which is redundant, so we trim that.
@@ -290,6 +297,10 @@ func (s *state) apply(ev testEvent) {
 		return
 	}
 
+	s.applyTest(pkg, ev)
+}
+
+func (s *state) applyTest(pkg *pkg, ev testEvent) {
 	// Test-level logic
 	mainTestName, _, _ := strings.Cut(ev.Test, "/")
 	isMain := ev.Test == mainTestName
