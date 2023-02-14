@@ -82,6 +82,7 @@ type pkg struct {
 	// Running state
 	mainTests int // Number of main tests
 	done      int // Only main tests, but includes failed
+	allDone   int // Main and sub-tests run, including failed
 	failed    int // Includes sub-tests
 	skipped   int // Includes sub-tests
 
@@ -99,6 +100,7 @@ type test struct {
 }
 
 func listTests(args []string) (tests pkgs, err error) {
+	// TODO: This is going to be misleading if there's a -test.run argument.
 	out, err := jsonRun(append([]string{"-test.list=^Test|^Fuzz|^Example"}, args...)...)
 	if err != nil {
 		return nil, err
@@ -281,7 +283,7 @@ func (s *state) apply(ev testEvent) {
 				}
 				fmt.Fprintf(term, "=== %s %s", label, ev.Package)
 				term.Attr()
-				fmt.Fprintf(term, " %d tests", len(pkg.tests))
+				fmt.Fprintf(term, " %d tests", pkg.allDone)
 				if pkg.failed > 0 {
 					fmt.Fprintf(term, ", %d failed", pkg.failed)
 				}
@@ -366,6 +368,7 @@ func (s *state) applyTest(pkg *pkg, ev testEvent) {
 		if isMain {
 			pkg.done++
 		}
+		pkg.allDone++
 		if ev.Action == "fail" {
 			pkg.failed++
 		} else if ev.Action == "skip" {
