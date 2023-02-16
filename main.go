@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -59,7 +58,8 @@ func main1(term *Term, args []string) error {
 	term.ClearRight()
 	term.Flush()
 
-	return runTests(term, args, tests)
+	r := NewTermRenderer(term)
+	return runTests(r, args, tests)
 }
 
 func setupSignals() {
@@ -77,21 +77,22 @@ func setupSignals() {
 type pkgs map[string]*pkg
 
 type pkg struct {
-	name  string
-	tests map[string]*test // Sub-tests are added while running.
+	name      string
+	mainTests int              // Number of main tests, or 0 if unknown
+	tests     map[string]*test // Sub-tests are added while running.
 
 	// Running state
-	mainTests int // Number of main tests
-	done      int // Only main tests, but includes failed
-	allDone   int // Main and sub-tests run, including failed
-	failed    int // Includes sub-tests
-	skipped   int // Includes sub-tests
+	done    int // Only main tests, but includes failed
+	allDone int // Main and sub-tests run, including failed
+	failed  int // Includes sub-tests
+	skipped int // Includes sub-tests
 
 	output bytes.Buffer
 }
 
 type test struct {
 	name string
+	pkg  *pkg
 
 	// For running tests.
 	start time.Time
@@ -125,8 +126,11 @@ func listTests(args []string) (tests pkgs, err error) {
 		// filter that out.
 		if ev.Action == "output" && ev.Package != "" && !strings.Contains(ev.Output, "\t") {
 			testName := strings.TrimRight(ev.Output, "\n")
-			p.tests[testName] = &test{name: testName}
+			p.tests[testName] = &test{name: testName, pkg: p}
 		}
+	}
+	for _, pkg := range tests {
+		pkg.mainTests = len(pkg.tests)
 	}
 	if err := out.wait(); err != nil {
 		return nil, fmt.Errorf("error listing tests: %w", err)
@@ -134,31 +138,7 @@ func listTests(args []string) (tests pkgs, err error) {
 	return tests, nil
 }
 
-type state struct {
-	lock sync.Mutex
-
-	tests      pkgs
-	maxPkgName int
-
-	runningPkgs  Seq[*pkg]
-	runningTests map[*pkg]*Seq[*test]
-
-	// Callbacks to flush output on the next render
-	output []func(t *Term)
-
-	prevLines int // Lines printed on the last render
-}
-
-func runTests(term *Term, args []string, tests pkgs) error {
-	maxPkgName := 0
-	for _, pkg := range tests {
-		// Ignore packages with no tests.
-		if len(pkg.tests) > 0 && len(pkg.name) > maxPkgName {
-			maxPkgName = len(pkg.name)
-		}
-		pkg.mainTests = len(pkg.tests)
-	}
-
+func runTests(r Renderer, args []string, tests pkgs) error {
 	out, err := jsonRun(args...)
 	if err != nil {
 		return err
@@ -167,30 +147,10 @@ func runTests(term *Term, args []string, tests pkgs) error {
 
 	s := state{
 		tests:        tests,
-		maxPkgName:   maxPkgName,
 		runningTests: make(map[*pkg]*Seq[*test]),
 	}
-	update := make(chan struct{}, 1)
-	go func() {
-		// Render thread.
-		timer := time.NewTimer(0)
-		for {
-			select {
-			case <-timer.C:
-			case _, ok := <-update:
-				if !ok {
-					break
-				}
-				if !timer.Stop() {
-					<-timer.C
-				}
-			}
-			next := s.render(term, 5)
-			term.Flush()
-			timer.Reset(time.Until(next))
-		}
-	}()
-	defer close(update)
+	r.Start(&s)
+	defer r.Stop()
 	for {
 		ev, err := out.next()
 		if err == io.EOF {
@@ -201,12 +161,9 @@ func runTests(term *Term, args []string, tests pkgs) error {
 
 		// TODO: Handle action=="error"
 
-		doUpdate := s.apply(ev)
-		if doUpdate || len(s.output) > 0 {
-			select {
-			case update <- struct{}{}:
-			default:
-			}
+		doUpdate := s.apply(r, ev)
+		if doUpdate {
+			r.Update()
 		}
 	}
 
@@ -217,13 +174,19 @@ func runTests(term *Term, args []string, tests pkgs) error {
 	return err
 }
 
-func (s *state) queueOutput(cb func(t *Term)) {
-	s.output = append(s.output, cb)
+// state interprets a stream of testEvents.
+type state struct {
+	lock sync.Mutex
+
+	tests pkgs
+
+	runningPkgs  Seq[*pkg]
+	runningTests map[*pkg]*Seq[*test]
 }
 
 // apply updates the state with the given testEvent and returns whether the
 // state needs to be re-rendered.
-func (s *state) apply(ev testEvent) bool {
+func (s *state) apply(r Renderer, ev testEvent) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -260,7 +223,7 @@ func (s *state) apply(ev testEvent) bool {
 			// sure the output appears even though there's no FAIL line.
 			if ev.Action == "fail" {
 				for _, t := range s.runningTests[pkg].o {
-					s.applyTest(pkg, testEvent{Action: "fail", Test: t.name})
+					s.applyTest(r, pkg, testEvent{Action: "fail", Test: t.name})
 				}
 			}
 			s.runningPkgs.Delete(pkg)
@@ -292,48 +255,22 @@ func (s *state) apply(ev testEvent) bool {
 			// If I did something like that, I should probably just use almost
 			// the whole terminal height. Alternatively, maybe I don't report
 			// the package status lines at all and just show a summary line?
-			s.queueOutput(func(term *Term) {
-				label := ""
-				switch ev.Action {
-				case "pass":
-					term.Attr(AttrBold, AttrGreen)
-					label = "PASS"
-				case "fail":
-					term.Attr(AttrBold, AttrRed)
-					label = "FAIL"
-				case "skip":
-					term.Attr(AttrBold, AttrYellow)
-					label = "SKIP"
-				}
-				fmt.Fprintf(term, "=== %s %s", label, ev.Package)
-				term.Attr()
-				fmt.Fprintf(term, " %d tests", pkg.allDone)
-				if pkg.failed > 0 {
-					fmt.Fprintf(term, ", %d failed", pkg.failed)
-				}
-				if pkg.skipped > 0 {
-					fmt.Fprintf(term, ", %d skipped", pkg.skipped)
-				}
-				term.WriteByte('\n')
-				if len(output) > 0 {
-					term.WriteString("    " + strings.ReplaceAll(output, "\n", "\n    ") + "\n")
-				}
-			})
+			r.PackageDone(pkg, ev.Action, output)
 			return true
 		}
 		return false
 	}
 
-	return s.applyTest(pkg, ev)
+	return s.applyTest(r, pkg, ev)
 }
 
-func (s *state) applyTest(pkg *pkg, ev testEvent) bool {
+func (s *state) applyTest(r Renderer, pkg *pkg, ev testEvent) bool {
 	// Test-level logic
 	mainTestName, _, _ := strings.Cut(ev.Test, "/")
 	isMain := ev.Test == mainTestName
 	t := pkg.tests[ev.Test]
 	if t == nil {
-		t = &test{name: ev.Test}
+		t = &test{name: ev.Test, pkg: pkg}
 		pkg.tests[t.name] = t
 		if isMain {
 			// Unexpected. Update the counter.
@@ -368,33 +305,7 @@ func (s *state) applyTest(pkg *pkg, ev testEvent) bool {
 		// Buffer the test output so we can print it if it fails.
 		t.output.WriteString(ev.Output)
 		return false
-	case "fail":
-		// TODO: Do I care about test order? Package order? If it's not in
-		// package order, how do I show which package a failed test is in? Maybe
-		// I just print custom fail lines anyway so I can put whatever I want.
-		//
-		// TODO: Print a summary and record the whole log somewhere with a
-		// command to print the details of a failed test (or any test).
-		output := t.output.Bytes()
-		s.queueOutput(func(term *Term) {
-			label := ""
-			switch ev.Action {
-			case "pass":
-				label = "PASS"
-				term.Attr(AttrGreen)
-			case "skip":
-				label = "SKIP"
-				term.Attr(AttrYellow)
-			case "fail":
-				label = "FAIL"
-				term.Attr(AttrRed)
-			}
-			fmt.Fprintf(term, "--- %s %s %s\n", label, ev.Test, ev.Package)
-			term.Attr()
-			term.Write(output)
-		})
-		fallthrough
-	case "pass", "skip":
+	case "pass", "fail", "skip":
 		s.runningTests[pkg].Delete(t)
 		if isMain {
 			pkg.done++
@@ -405,116 +316,17 @@ func (s *state) applyTest(pkg *pkg, ev testEvent) bool {
 		} else if ev.Action == "skip" {
 			pkg.skipped++
 		}
+		if ev.Action == "fail" {
+			// TODO: Do I care about test order? Package order? If it's not in
+			// package order, how do I show which package a failed test is in? Maybe
+			// I just print custom fail lines anyway so I can put whatever I want.
+			//
+			// TODO: Print a summary and record the whole log somewhere with a
+			// command to print the details of a failed test (or any test).
+			r.TestDone(t, ev.Action, t.output.String())
+		}
 		// Release test output memory.
 		t.output = bytes.Buffer{}
 		return true
 	}
-}
-
-// render draws s to the terminal and returns the time at which render should be
-// called again if there are no state changes.
-func (s *state) render(t *Term, h int) time.Time {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	// TODO: Query actual terminal height and don't exceed it.
-
-	// Clear previous lines
-	t.BeginningOfLine()
-	t.CursorUp(s.prevLines)
-	t.ClearDown()
-	s.prevLines = 0
-
-	// Flush output.
-	for _, cb := range s.output {
-		cb(t)
-	}
-	s.output = s.output[:0]
-
-	// Prep for these lines
-	t.SetWrap(false)
-	defer t.SetWrap(true)
-
-	// Compute the number of packages to show.
-	maxPkgs := s.runningPkgs.Len()
-	trimmedPkgs := 0
-	if maxPkgs > h {
-		trimmedPkgs = maxPkgs - (h - 1)
-		maxPkgs = h - 1
-	}
-
-	// Compute the package name length to show.
-	const pkgNameLimit = 20
-	maxPkgName := s.maxPkgName
-	if maxPkgName > pkgNameLimit {
-		maxPkgName = pkgNameLimit
-	}
-
-	next := time.Duration(math.MaxInt64)
-	for i, pkg := range s.runningPkgs.o {
-		if i > 0 {
-			t.WriteString("\n")
-			s.prevLines++
-		}
-		if pkg.failed == 0 {
-			t.Attr(AttrGreen)
-		} else {
-			t.Attr(AttrRed)
-		}
-		t.WriteString(lTrim(pkg.name, maxPkgName))
-		// TODO: Since I only show percentage, not count, maybe it makes sense
-		// to add sub-tests as I go, though that would make percent
-		// non-monotonic.
-		fmt.Fprintf(t, " %3d%%", int(0.5+100*float64(pkg.done)/float64(pkg.mainTests)))
-		t.Attr()
-		if pkg.failed > 0 {
-			fmt.Fprintf(t, " (%d failed)", pkg.failed)
-		}
-		// TODO: Print skip count?
-		for _, test := range s.runningTests[pkg].o {
-			fmt.Fprintf(t, " %s", test.name)
-			// TODO: This mixes "test time" and "system time".
-			dur := test.extra + time.Since(test.start)
-			durStr, next1 := fmtDuration(dur)
-			if dur >= time.Second {
-				fmt.Fprintf(t, " (%s)", durStr)
-			}
-			if next1 < next {
-				next = next1
-			}
-		}
-	}
-
-	if trimmedPkgs > 0 {
-		fmt.Fprintf(t, "\n... +%d packages ...", trimmedPkgs)
-		s.prevLines++
-	}
-
-	return time.Now().Add(next)
-}
-
-// lTrim pads s to length or trims the prefix of s to length.
-func lTrim(s string, length int) string {
-	if len(s) <= length {
-		return fmt.Sprintf("%-*s", length, s)
-	}
-	return "…" + s[len(s)-length+1:]
-}
-
-// fmtDuration formats d as a string and returns the duration after d when the
-// result will change.
-func fmtDuration(d time.Duration) (string, time.Duration) {
-	var b strings.Builder
-	if d >= time.Hour {
-		fmt.Fprintf(&b, "%dh", d/time.Hour)
-		d %= time.Hour
-	}
-	if b.Len() > 0 || d >= time.Minute {
-		fmt.Fprintf(&b, "%dm", d/time.Minute)
-		d %= time.Minute
-	}
-	fmt.Fprintf(&b, "%ds", d/time.Second)
-	// The output will change when the next second rolls over.
-	next := (d + time.Second).Truncate(time.Second) - d
-	return b.String(), next
 }
