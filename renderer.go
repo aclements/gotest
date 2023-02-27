@@ -13,6 +13,9 @@ import (
 )
 
 type Renderer interface {
+	// Status renders a progress status message. The caller should call cleanup
+	// when it's done.
+	Status(msg string) (cleanup func())
 	// Start starts rendering state. This can render state at any moment until
 	// Stop is called. Nothing else should write to the output surface between
 	// Start and Stop.
@@ -26,6 +29,8 @@ type Renderer interface {
 	PackageDone(pkg *pkg, action string, output string)
 	// TestDone displays the results of a complete test.
 	TestDone(test *test, action string, output string)
+	// Error prints an error.
+	Error(output string)
 }
 
 type termRenderer struct {
@@ -42,6 +47,16 @@ type termRenderer struct {
 func NewTermRenderer(term *Term) *termRenderer {
 	return &termRenderer{
 		term: term,
+	}
+}
+
+func (r *termRenderer) Status(msg string) (cleanup func()) {
+	fmt.Fprintf(r.term, "gathering tests...")
+	r.term.Flush()
+	return func() {
+		r.term.BeginningOfLine()
+		r.term.ClearRight()
+		r.term.Flush()
 	}
 }
 
@@ -84,7 +99,7 @@ func (r *termRenderer) Update() {
 
 func (r *termRenderer) PackageDone(pkg *pkg, action string, output string) {
 	r.queueOutput(func() {
-		label := ""
+		label := action
 		switch action {
 		case "pass":
 			r.term.Attr(AttrBold, AttrGreen)
@@ -129,6 +144,14 @@ func (r *termRenderer) TestDone(test *test, action string, output string) {
 		fmt.Fprintf(r.term, "--- %s %s %s\n", label, test.name, test.pkg.name)
 		r.term.Attr()
 		r.term.WriteString(output)
+	})
+}
+
+func (r *termRenderer) Error(output string) {
+	r.queueOutput(func() {
+		r.term.Attr(AttrRed)
+		fmt.Fprintf(r.term, "%s\n", output)
+		r.term.Attr()
 	})
 }
 

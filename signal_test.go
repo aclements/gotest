@@ -24,7 +24,7 @@ func init() {
 	}
 	// runTestProg normally skips signal setup, so do it explicitly.
 	setupSignals()
-	out, err := runTestProg("-run=TestSignalPassthru")
+	out, err := runTestProgRaw("-run=TestSignalPassthru")
 	// Tests just exit 1 when interrupted, so check for that error.
 	switch err := err.(type) {
 	case ErrExit:
@@ -86,11 +86,4 @@ func TestSignalPassthru(t *testing.T) {
 	if outBuf.String() != "ok\n" {
 		t.Fatalf("want ok, got:\n%s\n%s", outBuf.String(), errBuf.String())
 	}
-}
-
-func runTestProg(args ...string) ([]byte, error) {
-	var out bytes.Buffer
-	term := &Term{w: &out}
-	err := main1(term, append(args, "./testdata/testprog"))
-	return out.Bytes(), err
 }

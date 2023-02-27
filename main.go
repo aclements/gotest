@@ -19,18 +19,14 @@ import (
 func main() {
 	setupSignals()
 	term := NewTerm()
-	err := main1(term, os.Args[1:])
+	r := NewTermRenderer(term)
+	err := main1(r, os.Args[1:])
 	switch err := err.(type) {
 	case nil:
 		return
 	case ErrExit:
 		os.Exit(int(err))
 	default:
-		// Make sure the terminal is clear
-		term.BeginningOfLine()
-		term.ClearRight()
-		term.Flush()
-
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}
@@ -42,23 +38,21 @@ func (e ErrExit) Error() string {
 	return fmt.Sprintf("exit code %d", int(e))
 }
 
-func main1(term *Term, args []string) error {
-	// TODO: Test a package with a build error.
-	//
+func main1(r Renderer, args []string) error {
 	// TODO: We often spend a long time "gathering tests" because we're actually
 	// recompiling. Maybe I should just start running tests and gather the
 	// function names when I see a package start?
-	fmt.Fprintf(term, "gathering tests...")
-	term.Flush()
-	tests, err := listTests(args)
+	var tests pkgs
+	var err error
+	func() {
+		cleanup := r.Status("gathering tests...")
+		defer cleanup()
+		tests, err = listTests(args)
+	}()
 	if err != nil {
 		return err
 	}
-	term.BeginningOfLine()
-	term.ClearRight()
-	term.Flush()
 
-	r := NewTermRenderer(term)
 	return runTests(r, args, tests)
 }
 
@@ -76,9 +70,18 @@ func setupSignals() {
 
 type pkgs map[string]*pkg
 
+func (m pkgs) get(name string) *pkg {
+	if p := m[name]; p != nil {
+		return p
+	}
+	p := &pkg{name: name, tests: make(map[string]*test), mainTests: -1}
+	m[name] = p
+	return p
+}
+
 type pkg struct {
 	name      string
-	mainTests int              // Number of main tests, or 0 if unknown
+	mainTests int              // Number of main tests, or -1 if unknown
 	tests     map[string]*test // Sub-tests are added while running.
 
 	// Running state
@@ -90,9 +93,25 @@ type pkg struct {
 	output bytes.Buffer
 }
 
+func (p *pkg) getTest(name string) *test {
+	if t := p.tests[name]; t != nil {
+		return t
+	}
+
+	mainTestName, _, _ := strings.Cut(name, "/")
+	isMain := name == mainTestName
+	t := &test{name: name, mainName: mainTestName, pkg: p}
+	p.tests[t.name] = t
+	if isMain && p.mainTests != -1 {
+		p.mainTests++
+	}
+	return t
+}
+
 type test struct {
-	name string
-	pkg  *pkg
+	name     string
+	mainName string
+	pkg      *pkg
 
 	// For running tests.
 	start time.Time
@@ -117,24 +136,25 @@ func listTests(args []string) (tests pkgs, err error) {
 		} else if err != nil {
 			return nil, fmt.Errorf("error listing tests: %w", err)
 		}
-		p := tests[ev.Package]
-		if p == nil {
-			p = &pkg{name: ev.Package, tests: make(map[string]*test)}
-			tests[ev.Package] = p
-		}
+		p := tests.get(ev.Package)
 		// The output actions include the final "ok"/"?" line, so we need to
 		// filter that out.
 		if ev.Action == "output" && ev.Package != "" && !strings.Contains(ev.Output, "\t") {
 			testName := strings.TrimRight(ev.Output, "\n")
-			p.tests[testName] = &test{name: testName, pkg: p}
+			p.getTest(testName)
 		}
 	}
+	// Finalize counts for packages we were able to list.
 	for _, pkg := range tests {
-		pkg.mainTests = len(pkg.tests)
+		if len(pkg.tests) > 0 {
+			pkg.mainTests = len(pkg.tests)
+		}
 	}
-	if err := out.wait(); err != nil {
-		return nil, fmt.Errorf("error listing tests: %w", err)
-	}
+	// We ignore failures to list. These will be caught again when trying to run
+	// the tests, and those failures will better match user expectations. For
+	// example, if we list many packages and one has a build error, the whole
+	// list will fail, but we still want to run the other packages.
+	out.wait()
 	return tests, nil
 }
 
@@ -158,8 +178,6 @@ func runTests(r Renderer, args []string, tests pkgs) error {
 		} else if err != nil {
 			return fmt.Errorf("reading from go test: %w", err)
 		}
-
-		// TODO: Handle action=="error"
 
 		doUpdate := s.apply(r, ev)
 		if doUpdate {
@@ -190,14 +208,14 @@ func (s *state) apply(r Renderer, ev testEvent) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	// Package-level logic
-	pkg := s.tests[ev.Package]
-	if pkg == nil {
-		// This shouldn't happen because we started with a package list.
-		//
-		// TODO: Maybe be more robust to this.
-		return false
+	if ev.Action == "error" {
+		// Unattributed error. Probably something from stderr.
+		r.Error(ev.Output)
+		return true
 	}
+
+	// Package-level logic
+	pkg := s.tests.get(ev.Package)
 	if !s.runningPkgs.Has(pkg) {
 		s.runningPkgs.Append(pkg)
 		if _, ok := s.runningTests[pkg]; !ok {
@@ -266,17 +284,7 @@ func (s *state) apply(r Renderer, ev testEvent) bool {
 
 func (s *state) applyTest(r Renderer, pkg *pkg, ev testEvent) bool {
 	// Test-level logic
-	mainTestName, _, _ := strings.Cut(ev.Test, "/")
-	isMain := ev.Test == mainTestName
-	t := pkg.tests[ev.Test]
-	if t == nil {
-		t = &test{name: ev.Test, pkg: pkg}
-		pkg.tests[t.name] = t
-		if isMain {
-			// Unexpected. Update the counter.
-			pkg.mainTests++
-		}
-	}
+	t := pkg.getTest(ev.Test)
 	// TODO: What happens if a test times out? What if it times out at the
 	// cmd/go level?
 	switch ev.Action {
@@ -307,7 +315,7 @@ func (s *state) applyTest(r Renderer, pkg *pkg, ev testEvent) bool {
 		return false
 	case "pass", "fail", "skip":
 		s.runningTests[pkg].Delete(t)
-		if isMain {
+		if t.name == t.mainName { // Only count main tests toward "done"
 			pkg.done++
 		}
 		pkg.allDone++
