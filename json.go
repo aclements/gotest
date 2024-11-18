@@ -46,12 +46,14 @@ type jsonRunner struct {
 }
 
 type testEvent struct {
-	Time    time.Time // encodes as an RFC3339-format string
-	Action  string
-	Package string
-	Test    string
-	Elapsed float64 // seconds
-	Output  string
+	Time        time.Time // encodes as an RFC3339-format string
+	Action      string
+	ImportPath  string // for build-output and build-fail actions
+	Package     string
+	Test        string
+	Elapsed     float64 // seconds
+	Output      string
+	FailedBuild string
 }
 
 var textFailRe = regexp.MustCompile(`^FAIL\t([^ ]+) \[([^]]+)\]$`)
@@ -72,11 +74,11 @@ func (r *jsonRunner) next() (testEvent, error) {
 		if err == nil {
 			r.queued = append(r.queued, ev)
 		} else {
-			// Up to Go 1.20 at least, build errors are reported in plain text on stderr
-			// followed by a plain text FAIL line on stdout. Convert the FAIL line to a
-			// testEvent. There's not much we can do for stderr because we don't know
-			// what package it was attached to. (Workaround for go.dev/issue/35169 and
-			// go.dev/issue/23037)
+			// Until Go 1.24, build errors were reported in plain text on stderr
+			// followed by a plain text FAIL line on stdout. Convert the FAIL
+			// line to a testEvent. There's not much we can do for stderr
+			// because we don't know what package it was attached to.
+			// (Workaround for go.dev/issue/35169 and go.dev/issue/23037)
 			if subs := textFailRe.FindSubmatch(r.sc.Bytes()); subs != nil {
 				pkg := string(subs[1])
 				r.queued = append(r.queued,

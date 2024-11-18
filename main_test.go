@@ -28,10 +28,39 @@ testprog:[]
 func TestBuildError(t *testing.T) {
 	out, err := runTestProg("builderror")
 	wantExit(t, err, 1)
-	wantOutput(t, out, `gathering tests...
+	if strings.Contains(out, "error: ") {
+		// Pre Go 1.24 output
+		wantOutput(t, out, `gathering tests...
 error: # github.com/aclements/gotest/testdata/builderror [github.com/aclements/gotest/testdata/builderror.test]
 error: testdata/builderror/main_test.go:6:2: undefined: x
 === fail github.com/aclements/gotest/testdata/builderror
+`)
+		return
+	}
+	wantOutput(t, out, `gathering tests...
+=== fail github.com/aclements/gotest/testdata/builderror
+testdata/builderror/main_test.go:6:2: undefined: x
+`)
+}
+
+func TestSetupError(t *testing.T) {
+	out, err := runTestProg("setuperror")
+	wantExit(t, err, 1)
+	// As of Go 1.24 at least, this error is attributed to import path "x",
+	// which is the imported package name, so the package header doesn't get
+	// stripped. (go.dev/issue/59433, go.dev/issue/65335)
+	wantOutput(t, out, `gathering tests...
+=== fail github.com/aclements/gotest/testdata/setuperror
+testdata/setuperror/main_test.go:14:8: package x is not in std (/home/austin/go.tmp/src/x)
+`)
+}
+
+func TestVetError(t *testing.T) {
+	out, err := runTestProg("veterror")
+	wantExit(t, err, 1)
+	wantOutput(t, out, `gathering tests...
+=== fail github.com/aclements/gotest/testdata/veterror
+testdata/veterror/main_test.go:9:2: fmt.Printf format %s reads arg #1, but call has 0 args
 `)
 }
 
@@ -63,11 +92,11 @@ func (r *testRenderer) Update() {
 }
 
 func (r *testRenderer) PackageDone(pkg *pkg, action string, output string) {
-	fmt.Fprintf(&r.buf, "=== %s %s\n%s", action, pkg.name, pkg.output.String())
+	fmt.Fprintf(&r.buf, "=== %s %s\n%s", action, pkg.name, output)
 }
 
 func (r *testRenderer) TestDone(test *test, action string, output string) {
-	fmt.Fprintf(&r.buf, "--- %s %s\n%s", action, test.name, test.output.String())
+	fmt.Fprintf(&r.buf, "--- %s %s\n%s", action, test.name, output)
 }
 
 func (r *testRenderer) Error(output string) {

@@ -167,6 +167,7 @@ func runTests(r Renderer, args []string, tests pkgs) error {
 
 	s := state{
 		tests:        tests,
+		buildOutput:  make(map[string]*buildInfo),
 		runningTests: make(map[*pkg]*Seq[*test]),
 	}
 	r.Start(&s)
@@ -198,8 +199,17 @@ type state struct {
 
 	tests pkgs
 
+	buildOutput map[string]*buildInfo // By ImportPath
+
 	runningPkgs  Seq[*pkg]
 	runningTests map[*pkg]*Seq[*test]
+}
+
+type buildInfo struct {
+	importPath string
+	output     strings.Builder
+	failed     bool
+	reported   bool
 }
 
 // apply updates the state with the given testEvent and returns whether the
@@ -212,6 +222,24 @@ func (s *state) apply(r Renderer, ev testEvent) bool {
 		// Unattributed error. Probably something from stderr.
 		r.Error(ev.Output)
 		return true
+	}
+
+	// Go 1.24 build output
+	if ev.Action == "build-output" || ev.Action == "build-fail" {
+		b := s.buildOutput[ev.ImportPath]
+		if b == nil {
+			b = &buildInfo{importPath: ev.ImportPath}
+			s.buildOutput[ev.ImportPath] = b
+		}
+
+		switch ev.Action {
+		case "build-output": // Go 1.24 build JSON.
+			b.output.WriteString(ev.Output)
+			return false
+		case "build-fail": // Go 1.24 build JSON.
+			b.failed = true
+			return false
+		}
 	}
 
 	// Package-level logic
@@ -263,6 +291,20 @@ func (s *state) apply(r Renderer, ev testEvent) bool {
 			if strings.HasSuffix(output, "\n") {
 				// We'll add this back when printing.
 				output = output[:len(output)-1]
+			}
+			// Report any build errors.
+			if ev.FailedBuild != "" {
+				buildPkg := s.buildOutput[ev.FailedBuild]
+				if buildPkg != nil {
+					buildOutput := buildPkg.output.String()
+					// Trim redundant package lines
+					buildOutput = strings.TrimPrefix(buildOutput, "# "+ev.Package+" ["+ev.Package+".test]\n")
+					buildOutput = strings.TrimPrefix(buildOutput, "# "+ev.Package+"\n")
+					buildOutput = strings.TrimPrefix(buildOutput, "# ["+ev.Package+"]\n")
+					// Create combined output
+					output = buildOutput + output
+					buildPkg.reported = true
+				}
 			}
 			// Print the package status.
 			//
